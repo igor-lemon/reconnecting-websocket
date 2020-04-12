@@ -23,6 +23,15 @@ export type Event = Events.Event;
 export type ErrorEvent = Events.ErrorEvent;
 export type CloseEvent = Events.CloseEvent;
 
+// Template: { send: "ping", receive: "pong", delay: 5000, timeout: 1000, retry: 3 }
+export type Heartbeat = {
+    send: any;
+    receive: any;
+    delay: number;
+    timeout: number;
+    retry: number;
+};
+
 export type Options = {
     WebSocket?: any;
     maxReconnectionDelay?: number;
@@ -33,6 +42,7 @@ export type Options = {
     maxRetries?: number;
     maxEnqueuedMessages?: number;
     startClosed?: boolean;
+    heartbeat?: Heartbeat | null;
     debug?: boolean;
 };
 
@@ -45,6 +55,7 @@ const DEFAULT = {
     maxRetries: Infinity,
     maxEnqueuedMessages: Infinity,
     startClosed: false,
+    heartbeat: null,
     debug: false,
 };
 
@@ -70,11 +81,18 @@ export default class ReconnectingWebSocket {
     private _retryCount = -1;
     private _uptimeTimeout: any;
     private _connectTimeout: any;
+    private _heartbeatMessageTimeout: any;
+    private _heartbeatInterval: any;
     private _shouldReconnect = true;
     private _connectLock = false;
     private _binaryType: BinaryType = 'blob';
     private _closeCalled = false;
     private _messageQueue: Message[] = [];
+
+    private _keepAlive = false;
+    private _heartbeatRetryCount = 0;
+    private _pingTime = 0;
+    private _pongTime = 0;
 
     private readonly _url: UrlProvider;
     private readonly _protocols?: string | string[];
@@ -219,6 +237,7 @@ export default class ReconnectingWebSocket {
         this._closeCalled = true;
         this._shouldReconnect = false;
         this._clearTimeouts();
+        this._clearIntervals();
         if (!this._ws) {
             this._debug('close enqueued: no ws instance');
             return;
@@ -397,6 +416,7 @@ export default class ReconnectingWebSocket {
 
     private _disconnect(code = 1000, reason?: string) {
         this._clearTimeouts();
+        this._clearIntervals();
         if (!this._ws) {
             return;
         }
@@ -427,12 +447,84 @@ export default class ReconnectingWebSocket {
         }
     }
 
+    private _failHeartbeat = () => {
+        const {heartbeat = DEFAULT.heartbeat} = this._options;
+
+        if (!heartbeat) {
+            return;
+        }
+
+        const {retry} = heartbeat;
+        this._heartbeatRetryCount = this._heartbeatRetryCount + 1;
+        if (this._heartbeatRetryCount > retry) {
+            this._keepAlive = false;
+            this._debug('the number of ping attempts has been exhausted.');
+            this._disconnect(undefined, 'ping/pong exhausted');
+        } else {
+            this._debug('retry ping request');
+            this._callHeartbeat();
+        }
+    };
+
+    private _callHeartbeat = () => {
+        const {heartbeat = DEFAULT.heartbeat} = this._options;
+        if (!this._ws || !heartbeat) {
+            return;
+        }
+
+        const {send, timeout} = heartbeat;
+
+        this._pingTime = Date.now();
+        this._ws.send(send);
+        this._debug('send ping');
+
+        this._heartbeatMessageTimeout = setTimeout(() => {
+            const now = Date.now();
+            // We have Pong time to check it for Timeoute
+            if (this._pongTime) {
+                const runningTime = now - this._pongTime;
+                if (runningTime <= timeout) {
+                    this._heartbeatRetryCount = 0;
+                    this._keepAlive = true;
+                } else {
+                    this._debug('timeout for pong response');
+                    this._failHeartbeat();
+                }
+            } else {
+                this._debug("don't have last pong response time");
+                this._failHeartbeat();
+            }
+        }, timeout);
+    };
+
+    private _handleHeartbeatMessage = (event: MessageEvent) => {
+        const {heartbeat = DEFAULT.heartbeat} = this._options;
+
+        if (!heartbeat) {
+            return;
+        }
+
+        const {receive} = heartbeat;
+
+        if (receive === event.data) {
+            this._debug('receive pong');
+            this._pongTime = Date.now();
+        }
+    };
+
     private _handleOpen = (event: Event) => {
         this._debug('open event');
-        const {minUptime = DEFAULT.minUptime} = this._options;
+        const {heartbeat = DEFAULT.heartbeat, minUptime = DEFAULT.minUptime} = this._options;
 
         clearTimeout(this._connectTimeout);
         this._uptimeTimeout = setTimeout(() => this._acceptOpen(), minUptime);
+
+        if (heartbeat) {
+            const {delay} = heartbeat;
+            this._heartbeatRetryCount = 0;
+            this._heartbeatInterval = setInterval(this._callHeartbeat, delay);
+            this._debug('set heartbeat');
+        }
 
         this._ws!.binaryType = this._binaryType;
 
@@ -471,6 +563,7 @@ export default class ReconnectingWebSocket {
     private _handleClose = (event: Events.CloseEvent) => {
         this._debug('close event');
         this._clearTimeouts();
+        this._clearIntervals();
 
         if (this._shouldReconnect) {
             this._connect();
@@ -490,6 +583,7 @@ export default class ReconnectingWebSocket {
         this._ws.removeEventListener('open', this._handleOpen);
         this._ws.removeEventListener('close', this._handleClose);
         this._ws.removeEventListener('message', this._handleMessage);
+        this._ws.removeEventListener('message', this._handleHeartbeatMessage);
         // @ts-ignore
         this._ws.removeEventListener('error', this._handleError);
     }
@@ -502,6 +596,7 @@ export default class ReconnectingWebSocket {
         this._ws.addEventListener('open', this._handleOpen);
         this._ws.addEventListener('close', this._handleClose);
         this._ws.addEventListener('message', this._handleMessage);
+        this._ws.addEventListener('message', this._handleHeartbeatMessage);
         // @ts-ignore
         this._ws.addEventListener('error', this._handleError);
     }
@@ -509,5 +604,12 @@ export default class ReconnectingWebSocket {
     private _clearTimeouts() {
         clearTimeout(this._connectTimeout);
         clearTimeout(this._uptimeTimeout);
+        clearTimeout(this._heartbeatMessageTimeout);
+    }
+
+    private _clearIntervals() {
+        if (this._heartbeatInterval) {
+            clearInterval(this._heartbeatInterval);
+        }
     }
 }
